@@ -42,7 +42,13 @@ case "$STAGE" in
       exit 1
     fi
     # Drop the co-built Routerich device; keep BE12 Pro only.
-    sed '/routerich_be7200/d' "$base" > .config.base
+    # Also strip packages we deliberately remove from the base (UPnP, Easy QoS).
+    sed -e '/routerich_be7200/d' \
+        -e '/CONFIG_PACKAGE_luci-app-upnp/d' \
+        -e '/CONFIG_PACKAGE_miniupnpd-nftables/d' \
+        -e '/CONFIG_PACKAGE_luci-i18n-upnp-zh-cn/d' \
+        -e '/CONFIG_PACKAGE_luci-app-eqos-mtk/d' \
+        "$base" > .config.base
     cat .config.base .config.delta > .config
     rm -f .config.base
 

@@ -1,0 +1,274 @@
+#
+# Adapted from https://github.com/P3TERX/Actions-OpenWrt (MIT License)
+# and https://github.com/2048TB/Actions-ax6000
+#
+# File: .github/workflows/openwrt-builder.yml
+# Description: Build Tenda BE12 Pro ImmortalWrt (wifi7) using GitHub Actions
+#
+
+name: OpenWrt Builder
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 3 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openwrt-builder-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REPO_URL: https://github.com/chasey-dev/immortalwrt-mt798x-rebase
+  REPO_BRANCH: 25.12-dev-wifi7
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_SH: diy.sh
+  CACHE_VERSION: v1
+  CCACHE_DIR: ${{ github.workspace }}/openwrt/.ccache
+  TZ: Asia/Shanghai
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-22.04
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      upstream_hash: ${{ steps.get_hash.outputs.commit_hash }}
+    steps:
+    - name: Get upstream commit hash
+      id: get_hash
+      run: |
+        commit_hash="$(git ls-remote "$REPO_URL" "refs/heads/$REPO_BRANCH" | awk '{print $1}')"
+        if [ -z "$commit_hash" ]; then
+          echo "::error::Failed to resolve upstream commit hash for $REPO_URL/$REPO_BRANCH"
+          exit 1
+        fi
+        echo "commit_hash=$commit_hash" >> $GITHUB_OUTPUT
+
+    - name: Restore upstream hash cache
+      id: upstream_cache
+      uses: actions/cache@v5
+      with:
+        path: .upstream_hash
+        key: upstream-${{ env.REPO_BRANCH }}-${{ steps.get_hash.outputs.commit_hash }}
+        restore-keys: |
+          upstream-${{ env.REPO_BRANCH }}-
+
+    - name: Decide whether to build
+      id: decide
+      run: |
+        if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.upstream_cache.outputs.cache-hit }}" = "true" ]; then
+          echo "No upstream update detected on scheduled run; skip build."
+          echo "should_build=false" >> $GITHUB_OUTPUT
+        else
+          echo "${{ steps.get_hash.outputs.commit_hash }}" > .upstream_hash
+          echo "should_build=true" >> $GITHUB_OUTPUT
+        fi
+
+  build:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Show upstream hash
+      run: |
+        echo "Upstream hash: ${{ needs.check-upstream.outputs.upstream_hash }}"
+
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar file flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown "$USER:$(id -gn)" /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone --filter=blob:none --single-branch --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Prepare cache directories
+      run: |
+        mkdir -p openwrt/dl
+        mkdir -p openwrt/.ccache
+
+    - name: Restore dl cache
+      uses: actions/cache@v5
+      with:
+        path: openwrt/dl
+        key: ${{ runner.os }}-${{ env.REPO_BRANCH }}-dl-${{ env.CACHE_VERSION }}
+        restore-keys: |
+          ${{ runner.os }}-${{ env.REPO_BRANCH }}-dl-
+
+    - name: Reset Go module cache
+      run: rm -rf openwrt/dl/go-mod-cache
+
+    - name: Restore ccache
+      uses: actions/cache@v5
+      with:
+        path: openwrt/.ccache
+        key: ${{ runner.os }}-${{ env.REPO_BRANCH }}-ccache-${{ env.CACHE_VERSION }}-${{ hashFiles('.config', 'diy.sh') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ env.REPO_BRANCH }}-ccache-${{ env.CACHE_VERSION }}-
+          ${{ runner.os }}-${{ env.REPO_BRANCH }}-ccache-
+
+    - name: Load custom feeds
+      run: |
+        bash -n $DIY_SH
+        [ -e $FEEDS_CONF ] && cp -f $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_SH pre
+
+    - name: Update feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        $GITHUB_WORKSPACE/$DIY_SH feeds
+
+        if [ ! -d feeds/passwall2/luci-app-passwall2 ]; then
+          echo "::error::Missing passwall2 source feed: feeds/passwall2/luci-app-passwall2"
+          exit 1
+        fi
+        if [ ! -d feeds/passwall_packages/xray-core ]; then
+          echo "::error::Missing passwall package feed: feeds/passwall_packages/xray-core"
+          exit 1
+        fi
+
+        ./scripts/feeds update -i
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -d files ] && rsync -a files/ openwrt/files/
+        [ -e $CONFIG_FILE ] && cp -f $CONFIG_FILE openwrt/.config
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_SH post
+
+    - name: Validate custom configuration
+      run: |
+        cd openwrt
+        make defconfig
+        ./scripts/diffconfig.sh > custom-config.diff
+        echo "Resolved config delta:"
+        sed -n '1,220p' custom-config.diff
+
+        required_symbols=(
+          "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tenda_be12-pro"
+          "CONFIG_PACKAGE_luci"
+          "CONFIG_PACKAGE_luci-theme-argon"
+          "CONFIG_PACKAGE_luci-app-passwall2"
+          "CONFIG_PACKAGE_luci-app-passwall2_Basic_Core_Xray"
+          "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn"
+          "CONFIG_PACKAGE_xray-core"
+          "CONFIG_CCACHE"
+        )
+
+        for sym in "${required_symbols[@]}"; do
+          if ! grep -q "^${sym}=y$" .config; then
+            echo "::error::Missing required option after defconfig: ${sym}=y"
+            exit 1
+          fi
+        done
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make download -j8 || make download -j1 V=s
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        free -h
+        df -hT
+        ccache -M 8G
+        ccache -s || true
+
+        # Keep CI logs alive and expose CPU/memory hotspots while compiling.
+        (
+          while true; do
+            sleep 300
+            echo "[keepalive] $(date '+%F %T') compiling..."
+            ps -eo pid,ppid,%cpu,%mem,etime,cmd --sort=-%cpu | head -n 12
+          done
+        ) &
+        KEEPALIVE_PID=$!
+
+        set +e
+        make -j"$(nproc)"
+        RET=$?
+        kill "$KEEPALIVE_PID" 2>/dev/null || true
+        wait "$KEEPALIVE_PID" 2>/dev/null || true
+        set -e
+
+        if [ "$RET" -ne 0 ]; then
+          echo "Multi-thread compile failed, retrying with single thread..."
+          make -j1 || make -j1 V=s
+        fi
+
+        ccache -s || true
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET_DEVICE_.*_DEVICE_.*=y$' .config | head -1 | sed -r 's/.*_DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Purge Go module cache before saving dl cache
+      if: always()
+      run: rm -rf openwrt/dl/go-mod-cache
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Generate release tag
+      id: tag
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M%S")-${GITHUB_RUN_NUMBER}" >> $GITHUB_OUTPUT
+        echo "Build from $REPO_URL ($REPO_BRANCH)." > release.txt
+        echo "Device: ${{ env.DEVICE_NAME }}" >> release.txt
+        echo "Date: ${{ env.FILE_DATE }}" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v3
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: |
+          ${{ env.FIRMWARE }}/*sysupgrade.bin
+          ${{ env.FIRMWARE }}/*initramfs-kernel.bin

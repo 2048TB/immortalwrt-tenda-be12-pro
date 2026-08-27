@@ -31,6 +31,21 @@ case "$STAGE" in
     ;;
 
   post)
+    # Base config: upstream's official MT7987+MT7992 Wi-Fi 7 defconfig.
+    # It carries the whole closed-source MTK wifi7 driver stack (kmod-mt_wifi7,
+    # kmod-mt_hwifi, kmod-mt7992, warp, wifi-profile/l1profile) and — critically —
+    # selects DRIVER_11BE_SUPPORT, without which hostapd fails to build against
+    # the tree's MLO patches. Our .config is layered on top as a delta.
+    base="defconfig/low-mem-512m/mt7987-mt7992-be7200.config"
+    if [ ! -f "$base" ]; then
+      echo "Missing upstream base defconfig: $base" >&2
+      exit 1
+    fi
+    # Drop the co-built Routerich device; keep BE12 Pro only.
+    sed '/routerich_be7200/d' "$base" > .config.base
+    cat .config.base .config.delta > .config
+    rm -f .config.base
+
     # Default LAN IP 192.168.1.1 -> 192.168.3.1.
     cfg_file="package/base-files/files/bin/config_generate"
     if [ -f "$cfg_file" ]; then

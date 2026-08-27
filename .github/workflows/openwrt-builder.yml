@@ -158,7 +158,9 @@ jobs:
     - name: Load custom configuration
       run: |
         [ -d files ] && rsync -a files/ openwrt/files/
-        [ -e $CONFIG_FILE ] && cp -f $CONFIG_FILE openwrt/.config
+        # .config here is a DELTA layered on top of the upstream wifi7 defconfig
+        # by `diy.sh post`; it is not a standalone config.
+        [ -e $CONFIG_FILE ] && cp -f $CONFIG_FILE openwrt/.config.delta
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_SH post
 
@@ -179,6 +181,10 @@ jobs:
           "CONFIG_PACKAGE_luci-i18n-passwall2-zh-cn"
           "CONFIG_PACKAGE_xray-core"
           "CONFIG_CCACHE"
+          "CONFIG_PACKAGE_kmod-mt_wifi7"
+          "CONFIG_PACKAGE_kmod-mt7992"
+          "CONFIG_PACKAGE_wifi-profile"
+          "CONFIG_DRIVER_11BE_SUPPORT"
         )
 
         for sym in "${required_symbols[@]}"; do
@@ -187,6 +193,14 @@ jobs:
             exit 1
           fi
         done
+
+        # Exactly one target device, or we silently build the wrong firmware.
+        n_dev="$(grep -c '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config)"
+        if [ "$n_dev" -ne 1 ]; then
+          echo "::error::Expected exactly 1 target device, got $n_dev"
+          grep '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config
+          exit 1
+        fi
 
     - name: Download package
       id: package
